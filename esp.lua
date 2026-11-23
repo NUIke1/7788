@@ -1,635 +1,1400 @@
---!nocheck
-
+local UserInputService = game:GetService("UserInputService")
+local RS = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
 local Players = game:GetService("Players")
-local RunSvc = game:GetService("RunService")
 
-local ESP = {}
+local Device = UserInputService.TouchEnabled and "Mobile" or UserInputService.KeyboardEnabled and "PC"
+local CoreGui = gethui and gethui() or game:GetService("CoreGui")
 
-local DEFAULTS = {
-    Enabled            = false,
-    ShowBox            = true,
-    ShowName           = true,
-    ShowHealth         = true,
-    ShowDistance       = true,
-    ShowLine           = false,
-    ShowHeadDot        = false,
-    ShowSkeleton       = false,
+local Library = {
+    Settings = {
+        Tracers = true,
+        Distance = true,
+        Arrows = true,
+        Rainbow = false,
+        MaxDistance = 999999,
+        TextSize = 25,
+        Font = Enum.Font.RobotoMono,
+        FadeTime = 0.7,
+        ESPMode = "Highlight/Text",
+        RenderTime = (Device == "PC" and 240 or Device == "Mobile" and 30) or 60,
 
-    TextColor          = Color3.fromRGB(240, 240, 240),
-    OutlineColor       = Color3.fromRGB(0, 0, 0),
-    BoxColor           = Color3.fromRGB(255, 255, 255),
-    LineColor          = Color3.fromRGB(255, 255, 255),
-    HeadDotColor       = Color3.fromRGB(255, 80, 80),
-    SkeletonColor      = Color3.fromRGB(255, 255, 255),
+        LOD100 = 1,
+        LOD250 = 0.75,
+        LOD500 = 0.5,
+        LOD1000 = 0.25,
+        LODFar = 0.1,
 
-    BoxThickness       = 1,
-    LineThickness      = 1,
-    SkeletonThickness  = 1,
-    HeadDotSize        = 4,
+        AdaptiveLOD = true,
+        MovementPriority = true,
+        FrameBudget = 100,
+        MetadataInterval = 0.12,
+        RainbowRate = 30,
+        CleanupInterval = 2,
+    },
 
-    BoxFilled          = false,
-    BoxFillColor       = Color3.fromRGB(0, 0, 0),
-    BoxFillAlpha       = 0.35,
+    Cache = {},
 
-    LineOrigin         = "Bottom",
-    LinkBoxLineColor   = false,
+    TweenInfoFadeIn = nil,
+    TweenInfoFadeOut = nil,
 
-    Font               = Enum.Font.GothamMedium,
-    TextOutline        = true,
-    TextLineSpacing    = 2,
-    NameSize           = 13,
-    HealthSize         = 11,
-    DistSize           = 11,
-    CustomSize         = 13,
+    ESPCount = 0,
 
-    CustomText         = "",
-    CustomTextPos      = "Below",
+    Scheduler = {},
+    SchedulerSize = 0,
+    SchedulerEpoch = 0,
 
-    ShowHealthBar      = true,
-    HealthBarWidth     = 3,
-    HealthBarSide      = "Left",
-    HealthBarBg        = Color3.fromRGB(20, 20, 20),
-    HealthGood         = Color3.fromRGB(80, 220, 120),
-    HealthMid          = Color3.fromRGB(240, 200, 80),
-    HealthLow          = Color3.fromRGB(240, 80, 80),
-    HealthSmooth       = true,
+    LastCleanup = 0,
+    LastRainbow = 0,
+    RainbowColor = Color3.fromHSV(0, 1, 1),
 
-    Smoothing          = true,
-    SmoothFactor       = 0.4,
-    MaxDistance        = 0,
-    TeamCheck          = true,
-    ExcludeLocal       = true,
-    ExcludeDead        = true,
-    ExcludeNPC         = true,
-    DisplayOrder       = 2147480000,
-    MinBoxHeight       = 6,
+    Connection = nil,
+    Unloaded = false,
 }
 
-local state = {}
-for k, v in pairs(DEFAULTS) do state[k] = v end
+local Screen = Instance.new("ScreenGui")
+Screen.Name = HttpService:GenerateGUID(false)
+Screen.IgnoreGuiInset = true
+Screen.Parent = CoreGui
 
-local playerData = {}
-local container
-local renderConn
-local initialized = false
-
-local function getContainer()
-    if gethui then
-        local ok, h = pcall(gethui)
-        if ok and type(h) == "Instance" then return h end
+local function GetRoot(Object)
+    if not Object then
+        return nil
     end
-    local ok, cg = pcall(function() return game:GetService("CoreGui") end)
-    if ok and cg then return cg end
-    local ok2, pg = pcall(function() return Players.LocalPlayer:WaitForChild("PlayerGui", 10) end)
-    if ok2 and pg then return pg end
+
+    if Object:IsA("Model") then
+        return Object:FindFirstChild("HumanoidRootPart")
+            or Object.PrimaryPart
+            or Object:FindFirstChildWhichIsA("BasePart")
+    end
+
+    if Object:IsA("BasePart") then
+        return Object
+    end
+
     return nil
 end
 
-local function hpColor(ratio)
-    if ratio > 0.6 then return state.HealthGood end
-    if ratio > 0.3 then return state.HealthMid end
-    return state.HealthLow
-end
-
-local function worldToScreen(cam, pos)
-    local vp = cam:WorldToViewportPoint(pos)
-    if vp.Z <= 0.1 then return nil end
-    return Vector2.new(vp.X, vp.Y)
-end
-
-local function getCharacterBox(character)
-    local cam = workspace.CurrentCamera
-    if not cam then return nil end
-
-    local head = character:FindFirstChild("Head")
-    local hrp = character:FindFirstChild("HumanoidRootPart")
-    if not (head and hrp) then return nil end
-
-    local pHead = worldToScreen(cam, head.Position + Vector3.new(0, head.Size.Y * 0.5, 0))
-    local pFoot = worldToScreen(cam, hrp.Position - Vector3.new(0, hrp.Size.Y * 0.5 + 1.3, 0))
-    if not (pHead and pFoot) then return nil end
-
-    local topY, botY = pHead.Y, pFoot.Y
-    if botY <= topY + 1 then return nil end
-
-    local pCenter = worldToScreen(cam, (head.Position + hrp.Position) * 0.5)
-    if not pCenter then return nil end
-    local cx = pCenter.X
-
-    local maxHalf = 0
-    local function tryPart(part)
-        if not part or not part:IsA("BasePart") then return end
-        local p = worldToScreen(cam, part.Position)
-        if not p then return end
-        local d = math.abs(p.X - cx)
-        if d > maxHalf then maxHalf = d end
+local function FindHighlight(Object)
+    if not Object then
+        return nil
     end
 
-    tryPart(character:FindFirstChild("LeftUpperArm"))
-    tryPart(character:FindFirstChild("RightUpperArm"))
-    tryPart(character:FindFirstChild("Left Arm"))
-    tryPart(character:FindFirstChild("Right Arm"))
-    tryPart(character:FindFirstChild("LeftLowerLeg"))
-    tryPart(character:FindFirstChild("RightLowerLeg"))
-    tryPart(character:FindFirstChild("Left Leg"))
-    tryPart(character:FindFirstChild("Right Leg"))
-
-    local h = botY - topY
-    local halfW = maxHalf > 0 and (maxHalf * 1.15) or (h * 0.22)
-    halfW = math.clamp(halfW, h * 0.14, h * 0.55)
-
-    return cx - halfW, topY, cx + halfW, botY
+    return Object:FindFirstChildWhichIsA("Highlight", true)
 end
 
-local function newLabel(parent, name, size)
-    local l = Instance.new("TextLabel")
-    l.Name = name
-    l.BackgroundTransparency = 1
-    l.BorderSizePixel = 0
-    l.TextColor3 = state.TextColor
-    l.TextSize = size
-    l.Font = state.Font
-    l.TextXAlignment = Enum.TextXAlignment.Left
-    l.TextYAlignment = Enum.TextYAlignment.Top
-    l.TextStrokeTransparency = state.TextOutline and 0.4 or 1
-    l.TextStrokeColor3 = state.OutlineColor
-    l.RichText = true
-    l.Visible = false
-    l.ZIndex = 2147480000
-    l.Parent = parent
-    return l
-end
+local function SaveHighlightState(Highlight)
+    if not Highlight then
+        return nil
+    end
 
-local function ensure(player)
-    if playerData[player] then return playerData[player] end
-    container = container or getContainer()
-    if not container then return nil end
-
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "\0ESP_" .. player.Name
-    gui.ResetOnSpawn = false
-    gui.IgnoreGuiInset = true
-    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    gui.DisplayOrder = state.DisplayOrder
-    gui.Enabled = false
-    gui.Parent = container
-
-    local box = Instance.new("Frame")
-    box.Name = "Box"
-    box.BackgroundTransparency = 1
-    box.BorderSizePixel = 0
-    box.Visible = false
-    box.ZIndex = 2147480000
-    box.Parent = gui
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = state.BoxColor
-    stroke.Thickness = state.BoxThickness
-    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-    stroke.LineJoinMode = Enum.LineJoinMode.Miter
-    stroke.Parent = box
-
-    local barBg = Instance.new("Frame")
-    barBg.Name = "BarBg"
-    barBg.BackgroundColor3 = state.HealthBarBg
-    barBg.BorderSizePixel = 0
-    barBg.Visible = false
-    barBg.ZIndex = 2147480000
-    barBg.Parent = gui
-
-    local barFill = Instance.new("Frame")
-    barFill.Name = "BarFill"
-    barFill.BackgroundColor3 = state.HealthGood
-    barFill.BorderSizePixel = 0
-    barFill.AnchorPoint = Vector2.new(0, 1)
-    barFill.Position = UDim2.fromScale(0, 1)
-    barFill.Size = UDim2.fromScale(1, 1)
-    barFill.ZIndex = 2147480001
-    barFill.Parent = barBg
-
-    local line = Instance.new("Frame")
-    line.Name = "Line"
-    line.AnchorPoint = Vector2.new(0, 0.5)
-    line.BackgroundColor3 = state.LineColor
-    line.BorderSizePixel = 0
-    line.Visible = false
-    line.ZIndex = 2147480002
-    line.Parent = gui
-
-    local dot = Instance.new("Frame")
-    dot.Name = "HeadDot"
-    dot.AnchorPoint = Vector2.new(0.5, 0.5)
-    dot.BackgroundColor3 = state.HeadDotColor
-    dot.BorderSizePixel = 0
-    dot.Visible = false
-    dot.ZIndex = 2147480002
-    dot.Parent = gui
-    local dotStroke = Instance.new("UIStroke")
-    dotStroke.Color = Color3.fromRGB(0, 0, 0)
-    dotStroke.Thickness = 1
-    dotStroke.Parent = dot
-
-    local skelGui = Instance.new("Frame")
-    skelGui.Name = "Skeleton"
-    skelGui.BackgroundTransparency = 1
-    skelGui.Visible = false
-    skelGui.Size = UDim2.fromScale(1, 1)
-    skelGui.ZIndex = 2147480000
-    skelGui.Parent = gui
-
-    playerData[player] = {
-        Gui        = gui,
-        Box        = box,
-        Stroke     = stroke,
-        BarBg      = barBg,
-        BarFill    = barFill,
-        Line       = line,
-        Dot        = dot,
-        Skel       = skelGui,
-        SkelLines  = {},
-        NameLbl    = newLabel(gui, "Name", state.NameSize),
-        HealthLbl  = newLabel(gui, "Health", state.HealthSize),
-        DistLbl    = newLabel(gui, "Dist", state.DistSize),
-        CustomLbl  = newLabel(gui, "Custom", state.CustomSize),
-        Smooth     = {a = 0, b = 0, c = 0, d = 0, ready = false},
-        LastHp     = 0,
+    return {
+        Enabled = Highlight.Enabled,
+        Adornee = Highlight.Adornee,
+        FillColor = Highlight.FillColor,
+        FillTransparency = Highlight.FillTransparency,
+        OutlineColor = Highlight.OutlineColor,
+        OutlineTransparency = Highlight.OutlineTransparency,
+        DepthMode = Highlight.DepthMode,
     }
-    return playerData[player]
 end
 
-local function cleanup(player)
-    local d = playerData[player]
-    if d and d.Gui then
-        pcall(function() d.Gui:Destroy() end)
-    end
-    playerData[player] = nil
+local function IsValidHighlight(Highlight)
+    return Highlight ~= nil
+        and Highlight.Parent ~= nil
+        and Highlight:IsA("Highlight")
 end
 
-local function fmtText(tpl, player, hum, dist)
-    local s = tpl
-    s = s:gsub("{name}", player.Name)
-    s = s:gsub("{display}", player.DisplayName)
-    s = s:gsub("{health}", tostring(math.floor(hum.Health)))
-    s = s:gsub("{maxhealth}", tostring(math.floor(hum.MaxHealth)))
-    s = s:gsub("{dist}", tostring(math.floor(dist)))
-    s = s:gsub("{hp%%}", string.format("%d%%", math.floor(hum.Health / math.max(hum.MaxHealth, 1) * 100)))
-    s = s:gsub("{team}", player.Team and player.Team.Name or "None")
-    return s
-end
+local function RestoreHighlight(Data)
+    local Highlight = Data.Box
+    local Original = Data.OriginalHighlight
 
-local function drawSkeleton(d, character)
-    local cam = workspace.CurrentCamera
-    if not cam then return end
-
-    local r15 = {
-        {"Head", "UpperTorso"},
-        {"UpperTorso", "LowerTorso"},
-        {"UpperTorso", "LeftUpperArm"},
-        {"LeftUpperArm", "LeftLowerArm"},
-        {"LeftLowerArm", "LeftHand"},
-        {"UpperTorso", "RightUpperArm"},
-        {"RightUpperArm", "RightLowerArm"},
-        {"RightLowerArm", "RightHand"},
-        {"LowerTorso", "LeftUpperLeg"},
-        {"LeftUpperLeg", "LeftLowerLeg"},
-        {"LeftLowerLeg", "LeftFoot"},
-        {"LowerTorso", "RightUpperLeg"},
-        {"RightUpperLeg", "RightLowerLeg"},
-        {"RightLowerLeg", "RightFoot"},
-    }
-    local r6 = {
-        {"Head", "Torso"},
-        {"Torso", "Left Arm"},
-        {"Torso", "Right Arm"},
-        {"Torso", "Left Leg"},
-        {"Torso", "Right Leg"},
-    }
-    local set = character:FindFirstChild("UpperTorso") and r15 or r6
-    local idx = 0
-    for _, pair in ipairs(set) do
-        local a = character:FindFirstChild(pair[1])
-        local b = character:FindFirstChild(pair[2])
-        if a and b and a:IsA("BasePart") and b:IsA("BasePart") then
-            local va = worldToScreen(cam, a.Position)
-            local vb = worldToScreen(cam, b.Position)
-            if va and vb then
-                idx = idx + 1
-                local seg = d.SkelLines[idx]
-                if not seg then
-                    seg = Instance.new("Frame")
-                    seg.AnchorPoint = Vector2.new(0, 0.5)
-                    seg.BorderSizePixel = 0
-                    seg.ZIndex = 2147480000
-                    seg.Parent = d.Skel
-                    d.SkelLines[idx] = seg
-                end
-                local dx, dy = vb.X - va.X, vb.Y - va.Y
-                local len = math.sqrt(dx * dx + dy * dy)
-                seg.Visible = true
-                seg.BackgroundColor3 = state.SkeletonColor
-                seg.Position = UDim2.fromOffset(va.X, va.Y)
-                seg.Size = UDim2.fromOffset(len, state.SkeletonThickness)
-                seg.Rotation = math.deg(math.atan2(dy, dx))
-            end
-        end
-    end
-    for i = idx + 1, #d.SkelLines do
-        d.SkelLines[i].Visible = false
-    end
-end
-
-local function renderOne(player, d)
-    local lp = Players.LocalPlayer
-    if state.ExcludeLocal and player == lp then d.Gui.Enabled = false return end
-    if state.TeamCheck and player.Team ~= nil and player.Team == lp.Team then
-        d.Gui.Enabled = false
+    if not IsValidHighlight(Highlight) then
         return
     end
 
-    local ch = player.Character
-    if not ch then d.Gui.Enabled = false return end
-
-    local hum = ch:FindFirstChildOfClass("Humanoid")
-    if not hum then d.Gui.Enabled = false return end
-    if state.ExcludeDead and hum.Health <= 0 then d.Gui.Enabled = false return end
-
-    if state.ExcludeNPC and Players:GetPlayerFromCharacter(ch) == nil then
-        d.Gui.Enabled = false
+    if Data.HighlightInstance ~= Highlight then
         return
     end
 
-    local myCh = lp.Character
-    local myHrp = myCh and myCh:FindFirstChild("HumanoidRootPart")
-    local hrp = ch:FindFirstChild("HumanoidRootPart")
-    if not hrp then d.Gui.Enabled = false return end
-
-    local dist = myHrp and (myHrp.Position - hrp.Position).Magnitude or 0
-    if state.MaxDistance > 0 and dist > state.MaxDistance then
-        d.Gui.Enabled = false
+    if not Original then
         return
     end
 
-    local x1, y1, x2, y2 = getCharacterBox(ch)
-    if not x1 then d.Gui.Enabled = false return end
-    if x2 - x1 < 1 or y2 - y1 < state.MinBoxHeight then d.Gui.Enabled = false return end
-
-    if state.Smoothing then
-        local s = d.Smooth
-        local f = math.clamp(state.SmoothFactor, 0.05, 1)
-        if not s.ready then
-            s.a, s.b, s.c, s.d = x1, y1, x2, y2
-            s.ready = true
-        else
-            s.a = s.a + (x1 - s.a) * f
-            s.b = s.b + (y1 - s.b) * f
-            s.c = s.c + (x2 - s.c) * f
-            s.d = s.d + (y2 - s.d) * f
-        end
-        x1, y1, x2, y2 = s.a, s.b, s.c, s.d
-    end
-
-    d.Gui.Enabled = true
-    local w, h = x2 - x1, y2 - y1
-
-    d.Box.Visible = state.ShowBox
-    if state.ShowBox then
-        d.Box.Position = UDim2.fromOffset(x1, y1)
-        d.Box.Size = UDim2.fromOffset(w, h)
-        d.Box.BackgroundTransparency = state.BoxFilled and (1 - state.BoxFillAlpha) or 1
-        d.Box.BackgroundColor3 = state.BoxFillColor
-        d.Stroke.Color = state.BoxColor
-        d.Stroke.Thickness = state.BoxThickness
-    end
-
-    d.NameLbl.Visible = state.ShowName
-    if state.ShowName then
-        d.NameLbl.Text = player.DisplayName ~= player.Name
-            and (player.Name .. ' <font color="#888888">' .. player.DisplayName .. '</font>')
-            or player.Name
-        d.NameLbl.TextColor3 = state.TextColor
-        d.NameLbl.TextSize = state.NameSize
-        d.NameLbl.Font = state.Font
-        d.NameLbl.TextStrokeTransparency = state.TextOutline and 0.4 or 1
-        d.NameLbl.Position = UDim2.fromOffset(x1, y1 - state.NameSize - state.TextLineSpacing)
-        d.NameLbl.Size = UDim2.fromOffset(math.max(w, 140), state.NameSize + 2)
-    end
-
-    d.HealthLbl.Visible = state.ShowHealth
-    if state.ShowHealth then
-        local ratio = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
-        d.HealthLbl.Text = string.format("%d / %d", math.floor(hum.Health), math.floor(hum.MaxHealth))
-        d.HealthLbl.TextColor3 = hpColor(ratio)
-        d.HealthLbl.TextSize = state.HealthSize
-        d.HealthLbl.Font = state.Font
-        d.HealthLbl.TextStrokeTransparency = state.TextOutline and 0.4 or 1
-        d.HealthLbl.Position = UDim2.fromOffset(x1, y1 + h + state.TextLineSpacing)
-        d.HealthLbl.Size = UDim2.fromOffset(math.max(w, 90), state.HealthSize + 2)
-    end
-
-    d.DistLbl.Visible = state.ShowDistance
-    if state.ShowDistance then
-        d.DistLbl.Text = tostring(math.floor(dist)) .. "m"
-        d.DistLbl.TextColor3 = state.TextColor
-        d.DistLbl.TextSize = state.DistSize
-        d.DistLbl.Font = state.Font
-        d.DistLbl.TextStrokeTransparency = state.TextOutline and 0.4 or 1
-        local yOff = y1 + h + state.TextLineSpacing
-        if state.ShowHealth then yOff = yOff + state.HealthSize + 2 end
-        d.DistLbl.Position = UDim2.fromOffset(x1, yOff)
-        d.DistLbl.Size = UDim2.fromOffset(math.max(w, 60), state.DistSize + 2)
-    end
-
-    d.CustomLbl.Visible = state.CustomText ~= ""
-    if state.CustomText ~= "" then
-        d.CustomLbl.Text = fmtText(state.CustomText, player, hum, dist)
-        d.CustomLbl.TextColor3 = state.TextColor
-        d.CustomLbl.TextSize = state.CustomSize
-        d.CustomLbl.Font = state.Font
-        d.CustomLbl.TextStrokeTransparency = state.TextOutline and 0.4 or 1
-        if state.CustomTextPos == "Above" then
-            local yOff = y1 - state.CustomSize - state.TextLineSpacing
-            if state.ShowName then yOff = yOff - state.NameSize - 2 end
-            d.CustomLbl.Position = UDim2.fromOffset(x1, yOff)
-        else
-            local yOff = y1 + h + state.TextLineSpacing
-            if state.ShowHealth then yOff = yOff + state.HealthSize + 2 end
-            if state.ShowDistance then yOff = yOff + state.DistSize + 2 end
-            d.CustomLbl.Position = UDim2.fromOffset(x1, yOff)
-        end
-        d.CustomLbl.Size = UDim2.fromOffset(math.max(w, 180), state.CustomSize + 2)
-    end
-
-    d.BarBg.Visible = state.ShowHealthBar
-    if state.ShowHealthBar then
-        local ratio = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
-        if state.HealthSmooth then
-            d.LastHp = d.LastHp + (ratio - d.LastHp) * 0.25
-        else
-            d.LastHp = ratio
-        end
-        local draw = math.clamp(d.LastHp, 0.001, 1)
-        d.BarBg.Position = state.HealthBarSide == "Left"
-            and UDim2.fromOffset(x1 - state.HealthBarWidth - 2, y1)
-            or UDim2.fromOffset(x2 + 2, y1)
-        d.BarBg.Size = UDim2.fromOffset(state.HealthBarWidth, h)
-        d.BarBg.BackgroundColor3 = state.HealthBarBg
-        d.BarFill.BackgroundColor3 = hpColor(ratio)
-        d.BarFill.Size = UDim2.fromScale(1, draw)
-    end
-
-    d.Line.Visible = state.ShowLine
-    if state.ShowLine then
-        local cam = workspace.CurrentCamera
-        if cam then
-            local vp = cam.ViewportSize
-            local ox, oy
-            if state.LineOrigin == "Top" then
-                ox, oy = vp.X / 2, 60
-            elseif state.LineOrigin == "Center" then
-                ox, oy = vp.X / 2, vp.Y / 2
-            else
-                ox, oy = vp.X / 2, vp.Y - 60
-            end
-            local cxLine = x1 + w / 2
-            local cyLine = (state.LineOrigin == "Top") and y1 or (y1 + h)
-            local dx, dy = cxLine - ox, cyLine - oy
-            local len = math.sqrt(dx * dx + dy * dy)
-            if len > 1 then
-                d.Line.BackgroundColor3 = state.LineColor
-                d.Line.Position = UDim2.fromOffset(ox, oy)
-                d.Line.Size = UDim2.fromOffset(len, state.LineThickness)
-                d.Line.Rotation = math.deg(math.atan2(dy, dx))
-            else
-                d.Line.Visible = false
-            end
-        end
-    end
-
-    d.Dot.Visible = state.ShowHeadDot
-    if state.ShowHeadDot then
-        local cam = workspace.CurrentCamera
-        local head = ch:FindFirstChild("Head")
-        if head and cam then
-            local hp = worldToScreen(cam, head.Position)
-            if hp then
-                d.Dot.Position = UDim2.fromOffset(hp.X, hp.Y)
-                d.Dot.Size = UDim2.fromOffset(state.HeadDotSize, state.HeadDotSize)
-                d.Dot.BackgroundColor3 = state.HeadDotColor
-            else
-                d.Dot.Visible = false
-            end
-        else
-            d.Dot.Visible = false
-        end
-    end
-
-    d.Skel.Visible = state.ShowSkeleton
-    if state.ShowSkeleton then
-        drawSkeleton(d, ch)
-    end
+    Highlight.Enabled = Original.Enabled
+    Highlight.Adornee = Original.Adornee
+    Highlight.FillColor = Original.FillColor
+    Highlight.FillTransparency = Original.FillTransparency
+    Highlight.OutlineColor = Original.OutlineColor
+    Highlight.OutlineTransparency = Original.OutlineTransparency
+    Highlight.DepthMode = Original.DepthMode
 end
 
-local function render()
-    if not state.Enabled then
-        for _, d in pairs(playerData) do
-            if d.Gui then d.Gui.Enabled = false end
-        end
+local function ConfigureHighlight(Data, Highlight)
+    if not IsValidHighlight(Highlight) then
+        return false
+    end
+
+    local Object = Data.Object
+
+    if not Object or not Object.Parent then
+        return false
+    end
+
+    Highlight.Adornee = Object
+    Highlight.FillColor = Data.Color
+    Highlight.FillTransparency = 0.6
+    Highlight.OutlineTransparency = 1
+    Highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    Highlight.Enabled = true
+
+    Data.Box = Highlight
+    Data.HighlightInstance = Highlight
+    Data.LastHighlightColor = Data.Color
+    Data.LastBoxEnabled = true
+
+    return true
+end
+
+local function EnsureHighlight(Data)
+    local Object = Data.Object
+
+    if not Object or not Object.Parent then
+        Data.Box = nil
+        return nil
+    end
+
+    local Current = Data.Box
+
+    if IsValidHighlight(Current) then
+        ConfigureHighlight(Data, Current)
+        return Current
+    end
+
+    Data.Box = nil
+
+    local Existing = FindHighlight(Object)
+
+    if IsValidHighlight(Existing) then
+        Data.Box = Existing
+        Data.HighlightInstance = Existing
+        Data.OwnsHighlight = false
+        Data.OriginalHighlight = SaveHighlightState(Existing)
+
+        ConfigureHighlight(Data, Existing)
+
+        return Existing
+    end
+
+    local Highlight = Instance.new("Highlight")
+
+    Highlight.Name = "ESPHighlight"
+    Highlight.Adornee = Object
+    Highlight.Enabled = true
+    Highlight.FillColor = Data.Color
+    Highlight.FillTransparency = 0.6
+    Highlight.OutlineTransparency = 1
+    Highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    Highlight.Parent = Object
+
+    Data.Box = Highlight
+    Data.HighlightInstance = Highlight
+    Data.OwnsHighlight = true
+    Data.OriginalHighlight = nil
+    Data.LastHighlightColor = Data.Color
+    Data.LastBoxEnabled = true
+
+    return Highlight
+end
+
+local function ReleaseHighlight(Data)
+    local Highlight = Data.Box
+
+    if not Highlight then
         return
     end
-    for player, d in pairs(playerData) do
-        local ok = pcall(renderOne, player, d)
-        if not ok and d.Gui then d.Gui.Enabled = false end
-    end
-end
 
-function ESP:Init(opts)
-    if initialized then
-        if type(opts) == "table" then ESP:Set(opts) end
-        return ESP
-    end
-    if type(opts) == "table" then
-        for k, v in pairs(opts) do
-            if k ~= "Name" and state[k] ~= nil then state[k] = v end
+    if Data.OwnsHighlight then
+        if IsValidHighlight(Highlight) then
+            Highlight:Destroy()
         end
-    end
-    container = getContainer()
-    if not container then
-        error("ESP.Init: 无法挂载 GUI（gethui / CoreGui / PlayerGui 全部失败）")
-    end
-    for _, p in ipairs(Players:GetPlayers()) do
-        ensure(p)
-    end
-    Players.PlayerAdded:Connect(function(p) ensure(p) end)
-    Players.PlayerRemoving:Connect(cleanup)
-    renderConn = RunSvc.RenderStepped:Connect(render)
-    initialized = true
-    return ESP
-end
-
-function ESP:Set(opts)
-    if type(opts) ~= "table" then return ESP end
-    for k, v in pairs(opts) do
-        if k == "Name" then
-            ESP.Name = v
-        elseif state[k] ~= nil then
-            state[k] = v
-        end
-    end
-    if opts.BoxColor ~= nil and state.LinkBoxLineColor then
-        state.LineColor = opts.BoxColor
-    end
-    if opts.DisplayOrder ~= nil then
-        for _, d in pairs(playerData) do
-            if d.Gui then d.Gui.DisplayOrder = opts.DisplayOrder end
-        end
-    end
-    return ESP
-end
-
-function ESP:Get(key)
-    if key == "Name" then return ESP.Name end
-    return state[key]
-end
-
-function ESP:Toggle(v)
-    if v == nil then
-        state.Enabled = not state.Enabled
     else
-        state.Enabled = v and true or false
+        RestoreHighlight(Data)
     end
-    return ESP
+
+    Data.Box = nil
+    Data.HighlightInstance = nil
+    Data.OriginalHighlight = nil
+    Data.OwnsHighlight = false
+    Data.LastBoxEnabled = false
 end
 
-function ESP:Enable() state.Enabled = true return ESP end
-function ESP:Disable() state.Enabled = false return ESP end
+local function HeapPush(Heap, Size, Node)
+    Size += 1
 
-function ESP:AddPlayer(p) return ensure(p) end
+    local Index = Size
 
-function ESP:Refresh()
-    for p in pairs(playerData) do cleanup(p) end
-    for _, p in ipairs(Players:GetPlayers()) do ensure(p) end
-    return ESP
-end
+    while Index > 1 do
+        local Parent = math.floor(Index / 2)
 
-function ESP:Clear()
-    for p in pairs(playerData) do cleanup(p) end
-    return ESP
-end
+        if Heap[Parent].Time <= Node.Time then
+            break
+        end
 
-function ESP:Destroy()
-    if renderConn then
-        renderConn:Disconnect()
-        renderConn = nil
+        Heap[Index] = Heap[Parent]
+        Index = Parent
     end
-    for p in pairs(playerData) do cleanup(p) end
-    initialized = false
-    return ESP
+
+    Heap[Index] = Node
+
+    return Size
 end
 
-function ESP:Defaults()
-    local t = {}
-    for k, v in pairs(DEFAULTS) do t[k] = v end
-    return t
+local function HeapPop(Heap, Size)
+    if Size <= 0 then
+        return nil, 0
+    end
+
+    local Root = Heap[1]
+    local Last = Heap[Size]
+
+    Heap[Size] = nil
+    Size -= 1
+
+    if Size <= 0 then
+        return Root, 0
+    end
+
+    local Index = 1
+
+    while true do
+        local Left = Index * 2
+
+        if Left > Size then
+            break
+        end
+
+        local Right = Left + 1
+        local Child = Left
+
+        if Right <= Size and Heap[Right].Time < Heap[Left].Time then
+            Child = Right
+        end
+
+        if Heap[Child].Time >= Last.Time then
+            break
+        end
+
+        Heap[Index] = Heap[Child]
+        Index = Child
+    end
+
+    Heap[Index] = Last
+
+    return Root, Size
 end
 
-return ESP
+local function GetLODInterval(DistanceSquared, RenderTime, Settings, ESPCount)
+    local Multiplier
+
+    if DistanceSquared <= 10000 then
+        Multiplier = Settings.LOD100
+    elseif DistanceSquared <= 62500 then
+        Multiplier = Settings.LOD250
+    elseif DistanceSquared <= 250000 then
+        Multiplier = Settings.LOD500
+    elseif DistanceSquared <= 1000000 then
+        Multiplier = Settings.LOD1000
+    else
+        Multiplier = Settings.LODFar
+    end
+
+    Multiplier = math.max(Multiplier, 0.01)
+
+    if Settings.AdaptiveLOD then
+        if ESPCount > 150 then
+            Multiplier *= 0.45
+        elseif ESPCount > 100 then
+            Multiplier *= 0.6
+        elseif ESPCount > 60 then
+            Multiplier *= 0.8
+        end
+    end
+
+    return math.max(
+        1 / math.max(RenderTime, 1) / Multiplier,
+        1 / 60
+    )
+end
+
+local function SetVisible(Data, TagVisible, TextVisible, LineVisible, ArrowVisible)
+    if Data.Tag and Data.LastTagEnabled ~= TagVisible then
+        Data.Tag.Enabled = TagVisible
+        Data.LastTagEnabled = TagVisible
+    end
+
+    if Data.Text and Data.LastTextVisible ~= TextVisible then
+        Data.Text.Visible = TextVisible
+        Data.LastTextVisible = TextVisible
+    end
+
+    if Data.Line and Data.LastLineVisible ~= LineVisible then
+        Data.Line.Visible = LineVisible
+        Data.LastLineVisible = LineVisible
+    end
+
+    if Data.Arrow and Data.LastArrowVisible ~= ArrowVisible then
+        Data.Arrow.Visible = ArrowVisible
+        Data.LastArrowVisible = ArrowVisible
+    end
+end
+
+local function SetHighlightEnabled(Data, Enabled)
+    local Highlight = Data.Box
+
+    if not IsValidHighlight(Highlight) then
+        Data.LastBoxEnabled = false
+        return
+    end
+
+    if Highlight.Enabled ~= Enabled then
+        Highlight.Enabled = Enabled
+    end
+
+    Data.LastBoxEnabled = Enabled
+end
+
+local function SetTextColor(Data, Color)
+    if Data.Text and Data.LastTextColor ~= Color then
+        Data.Text.TextColor3 = Color
+        Data.LastTextColor = Color
+    end
+end
+
+local function SetLineColor(Data, Color)
+    if Data.Line and Data.LastLineColor ~= Color then
+        Data.Line.BackgroundColor3 = Color
+        Data.LastLineColor = Color
+    end
+end
+
+local function SetArrowColor(Data, Color)
+    if Data.Arrow and Data.LastArrowColor ~= Color then
+        Data.Arrow.ImageColor3 = Color
+        Data.LastArrowColor = Color
+    end
+end
+
+local function SetHighlightColor(Data, Color)
+    local Highlight = Data.Box
+
+    if IsValidHighlight(Highlight) and Data.LastHighlightColor ~= Color then
+        Highlight.FillColor = Color
+        Data.LastHighlightColor = Color
+    end
+end
+
+local function ScheduleData(Data, Time)
+    Library.SchedulerSize = HeapPush(
+        Library.Scheduler,
+        Library.SchedulerSize,
+        {
+            Time = Time,
+            Object = Data.Object,
+            Version = Data.ScheduleVersion,
+            Epoch = Library.SchedulerEpoch,
+        }
+    )
+end
+
+local function ScheduleObject(Data, Time)
+    Data.NextUpdate = Time
+    Data.ScheduleVersion += 1
+    ScheduleData(Data, Time)
+end
+
+local function InvalidateScheduler()
+    Library.SchedulerEpoch += 1
+    Library.Scheduler = {}
+    Library.SchedulerSize = 0
+
+    local Now = os.clock()
+
+    for _, Data in pairs(Library.Cache) do
+        Data.ScheduleVersion += 1
+        Data.NextUpdate = Now
+
+        ScheduleData(Data, Now)
+    end
+end
+
+function Library:RebuildTweenInfo()
+    local FadeTime = math.max(self.Settings.FadeTime, 0)
+
+    self.TweenInfoFadeIn = TweenInfo.new(
+        FadeTime,
+        Enum.EasingStyle.Linear,
+        Enum.EasingDirection.Out
+    )
+
+    self.TweenInfoFadeOut = TweenInfo.new(
+        FadeTime,
+        Enum.EasingStyle.Linear,
+        Enum.EasingDirection.Out
+    )
+end
+
+Library:RebuildTweenInfo()
+
+function Library:SetFont(Font)
+    self.Settings.Font = Font
+
+    for _, Data in pairs(self.Cache) do
+        if Data.Text then
+            Data.Text.Font = Font
+        end
+    end
+end
+
+function Library:SetRainbow(Value)
+    self.Settings.Rainbow = Value
+    InvalidateScheduler()
+end
+
+function Library:SetFadeTime(Value)
+    self.Settings.FadeTime = math.max(Value, 0)
+    self:RebuildTweenInfo()
+end
+
+function Library:SetArrows(Value)
+    self.Settings.Arrows = Value
+    InvalidateScheduler()
+end
+
+function Library:SetTracers(Value)
+    self.Settings.Tracers = Value
+    InvalidateScheduler()
+end
+
+function Library:SetShowDistance(Value)
+    self.Settings.Distance = Value
+    InvalidateScheduler()
+end
+
+function Library:SetESPMode(Value)
+    self.Settings.ESPMode = Value
+    InvalidateScheduler()
+end
+
+function Library:SetRenderingSpeed(Value)
+    self.Settings.RenderTime = math.max(Value, 1)
+    InvalidateScheduler()
+end
+
+function Library:HasESP(Object)
+    return self.Cache[Object] ~= nil
+end
+
+function Library:GetESPData(Object)
+    return self.Cache[Object]
+end
+
+function Library:GetAllESP()
+    local Result = {}
+
+    for Object, Data in pairs(self.Cache) do
+        Result[Object] = {
+            Name = Data.Name,
+            Color = Data.Color,
+            Root = Data.Root,
+        }
+    end
+
+    return Result
+end
+
+function Library:CountESP()
+    return self.ESPCount
+end
+
+function Library:AddESP(Cfg)
+    if self.Unloaded then
+        return
+    end
+
+    if not Cfg then
+        return
+    end
+
+    local Object = Cfg.Object
+
+    if not Object or self.Cache[Object] then
+        return
+    end
+
+    local Root = GetRoot(Object)
+
+    if not Root then
+        task.spawn(function()
+            local Attempts = 0
+
+            while Object.Parent and Attempts < 60 and not self.Unloaded do
+                Root = GetRoot(Object)
+
+                if Root then
+                    break
+                end
+
+                Attempts += 1
+                task.wait(0.5)
+            end
+
+            if Root and Object.Parent and not self.Cache[Object] and not self.Unloaded then
+                self:AddESP(Cfg)
+            end
+        end)
+
+        return
+    end
+
+    local InitialColor = Cfg.Color or Color3.new(1, 1, 1)
+    local InitialText = Cfg.Text or "ESP"
+
+    local Billboard = Instance.new("BillboardGui")
+    Billboard.Name = HttpService:GenerateGUID(false)
+    Billboard.Size = UDim2.new(0, 250, 0, 60)
+    Billboard.AlwaysOnTop = true
+    Billboard.Adornee = Root
+    Billboard.MaxDistance = self.Settings.MaxDistance
+    Billboard.Parent = Object
+
+    local Label = Instance.new("TextLabel")
+    Label.BackgroundTransparency = 1
+    Label.Size = UDim2.new(1, 0, 1, 0)
+    Label.TextColor3 = InitialColor
+    Label.Font = self.Settings.Font
+    Label.TextSize = self.Settings.TextSize
+    Label.TextStrokeTransparency = 0
+    Label.TextTransparency = 1
+    Label.Text = InitialText
+    Label.Parent = Billboard
+
+    local Line = Instance.new("Frame")
+    Line.AnchorPoint = Vector2.new(0.5, 0.5)
+    Line.BorderSizePixel = 0
+    Line.BackgroundColor3 = InitialColor
+    Line.Visible = true
+    Line.BackgroundTransparency = 1
+    Line.Parent = Screen
+
+    local Arrow = Instance.new("ImageLabel")
+    Arrow.BackgroundTransparency = 1
+    Arrow.AnchorPoint = Vector2.new(0.5, 0.5)
+    Arrow.Size = UDim2.new(0, 32, 0, 32)
+    Arrow.Image = "rbxassetid://10526559647"
+    Arrow.ImageColor3 = InitialColor
+    Arrow.Visible = false
+    Arrow.Parent = Screen
+
+    local Data = {
+        Object = Object,
+
+        Tag = Billboard,
+        Text = Label,
+        Line = Line,
+        Box = nil,
+        Arrow = Arrow,
+
+        Name = InitialText,
+        Color = InitialColor,
+        Root = Root,
+
+        OwnsHighlight = false,
+        HighlightInstance = nil,
+        OriginalHighlight = nil,
+
+        NextUpdate = 0,
+        NextMetadataUpdate = 0,
+
+        LastPosition = Root.Position,
+        LastDistance = -1,
+        LastDisplayedDistance = -1,
+
+        LastTextColor = InitialColor,
+        LastHighlightColor = InitialColor,
+        LastLineColor = InitialColor,
+        LastArrowColor = InitialColor,
+
+        LastTextSize = self.Settings.TextSize,
+
+        LastTagEnabled = true,
+        LastTextVisible = false,
+        LastBoxEnabled = false,
+        LastLineVisible = true,
+        LastArrowVisible = false,
+
+        LastTracerX = -1,
+        LastTracerY = -1,
+        LastTracerLength = -1,
+        LastTracerRotation = -999,
+
+        LastArrowX = -1,
+        LastArrowY = -1,
+        LastArrowRotation = -999,
+
+        ScheduleVersion = 0,
+        FadeToken = 0,
+    }
+
+    self.Cache[Object] = Data
+    self.ESPCount += 1
+
+    local ExistingHighlight = FindHighlight(Object)
+
+    if IsValidHighlight(ExistingHighlight) then
+        Data.Box = ExistingHighlight
+        Data.HighlightInstance = ExistingHighlight
+        Data.OwnsHighlight = false
+        Data.OriginalHighlight = SaveHighlightState(ExistingHighlight)
+
+        ConfigureHighlight(Data, ExistingHighlight)
+    end
+
+    local FadeTime = self.Settings.FadeTime
+
+    if FadeTime > 0 then
+        TweenService:Create(
+            Label,
+            self.TweenInfoFadeIn,
+            {TextTransparency = 0}
+        ):Play()
+
+        if IsValidHighlight(Data.Box) then
+            TweenService:Create(
+                Data.Box,
+                self.TweenInfoFadeIn,
+                {FillTransparency = 0.6}
+            ):Play()
+        end
+
+        TweenService:Create(
+            Line,
+            self.TweenInfoFadeIn,
+            {BackgroundTransparency = 0}
+        ):Play()
+    else
+        Label.TextTransparency = 0
+
+        if IsValidHighlight(Data.Box) then
+            Data.Box.FillTransparency = 0.6
+            Data.Box.Enabled = true
+        end
+
+        Line.BackgroundTransparency = 0
+    end
+
+    local Now = os.clock()
+
+    Data.NextMetadataUpdate = Now
+
+    ScheduleObject(Data, Now)
+end
+
+function Library:RemoveESP(Object)
+    local Data = self.Cache[Object]
+
+    if not Data then
+        return
+    end
+
+    self.Cache[Object] = nil
+    self.ESPCount = math.max(self.ESPCount - 1, 0)
+
+    Data.ScheduleVersion += 1
+    Data.FadeToken += 1
+
+    local Token = Data.FadeToken
+    local FadeTime = math.max(self.Settings.FadeTime, 0)
+
+    if FadeTime > 0 then
+        if Data.Text and Data.Text.Parent then
+            TweenService:Create(
+                Data.Text,
+                self.TweenInfoFadeOut,
+                {TextTransparency = 1}
+            ):Play()
+        end
+
+        if IsValidHighlight(Data.Box) then
+            TweenService:Create(
+                Data.Box,
+                self.TweenInfoFadeOut,
+                {FillTransparency = 1}
+            ):Play()
+        end
+
+        if Data.Line and Data.Line.Parent then
+            TweenService:Create(
+                Data.Line,
+                self.TweenInfoFadeOut,
+                {BackgroundTransparency = 1}
+            ):Play()
+        end
+
+        task.delay(FadeTime, function()
+            if Data.FadeToken ~= Token then
+                return
+            end
+
+            ReleaseHighlight(Data)
+
+            if Data.Tag and Data.Tag.Parent then
+                Data.Tag:Destroy()
+            end
+
+            if Data.Line and Data.Line.Parent then
+                Data.Line:Destroy()
+            end
+
+            if Data.Arrow and Data.Arrow.Parent then
+                Data.Arrow:Destroy()
+            end
+        end)
+    else
+        ReleaseHighlight(Data)
+
+        if Data.Tag and Data.Tag.Parent then
+            Data.Tag:Destroy()
+        end
+
+        if Data.Line and Data.Line.Parent then
+            Data.Line:Destroy()
+        end
+
+        if Data.Arrow and Data.Arrow.Parent then
+            Data.Arrow:Destroy()
+        end
+    end
+end
+
+function Library:UpdateESP(Object, NewText, NewColor)
+    local Data = self.Cache[Object]
+
+    if Data then
+        if NewText and Data.Name ~= NewText then
+            Data.Name = NewText
+            Data.Text.Text = NewText
+            Data.LastDisplayedDistance = -1
+            Data.NextMetadataUpdate = 0
+        end
+
+        if NewColor and Data.Color ~= NewColor then
+            Data.Color = NewColor
+
+            if Data.Text then
+                Data.Text.TextColor3 = NewColor
+            end
+
+            if IsValidHighlight(Data.Box) then
+                Data.Box.FillColor = NewColor
+            end
+
+            if Data.Line then
+                Data.Line.BackgroundColor3 = NewColor
+            end
+
+            if Data.Arrow then
+                Data.Arrow.ImageColor3 = NewColor
+            end
+
+            Data.LastTextColor = NewColor
+            Data.LastHighlightColor = NewColor
+            Data.LastLineColor = NewColor
+            Data.LastArrowColor = NewColor
+        end
+
+        ScheduleObject(Data, os.clock())
+    else
+        self:AddESP({
+            Object = Object,
+            Text = NewText or "ESP",
+            Color = NewColor or Color3.new(1, 1, 1),
+        })
+    end
+end
+
+function Library:BulkUpdateESP(UpdateTable)
+    local Now = os.clock()
+
+    for Object, Info in pairs(UpdateTable) do
+        local Data = self.Cache[Object]
+
+        if Data then
+            if Info.Text and Data.Name ~= Info.Text then
+                Data.Name = Info.Text
+                Data.Text.Text = Info.Text
+                Data.LastDisplayedDistance = -1
+                Data.NextMetadataUpdate = 0
+            end
+
+            if Info.Color and Data.Color ~= Info.Color then
+                local Color = Info.Color
+
+                Data.Color = Color
+
+                if Data.Text then
+                    Data.Text.TextColor3 = Color
+                end
+
+                if IsValidHighlight(Data.Box) then
+                    Data.Box.FillColor = Color
+                end
+
+                if Data.Line then
+                    Data.Line.BackgroundColor3 = Color
+                end
+
+                if Data.Arrow then
+                    Data.Arrow.ImageColor3 = Color
+                end
+
+                Data.LastTextColor = Color
+                Data.LastHighlightColor = Color
+                Data.LastLineColor = Color
+                Data.LastArrowColor = Color
+            end
+
+            ScheduleObject(Data, Now)
+        elseif Info.Text and Info.Color then
+            self:AddESP({
+                Object = Object,
+                Text = Info.Text,
+                Color = Info.Color,
+            })
+        end
+    end
+end
+
+function Library:ClearAllESP()
+    local Objects = {}
+
+    for Object in pairs(self.Cache) do
+        Objects[#Objects + 1] = Object
+    end
+
+    for i = 1, #Objects do
+        self:RemoveESP(Objects[i])
+    end
+end
+
+function Library:Unload()
+    if self.Unloaded then
+        return
+    end
+
+    self.Unloaded = true
+
+    if self.Connection then
+        self.Connection:Disconnect()
+        self.Connection = nil
+    end
+
+    self.Scheduler = {}
+    self.SchedulerSize = 0
+    self.SchedulerEpoch += 1
+
+    for Object, Data in pairs(self.Cache) do
+        self.Cache[Object] = nil
+
+        Data.FadeToken += 1
+
+        ReleaseHighlight(Data)
+
+        if Data.Tag and Data.Tag.Parent then
+            Data.Tag:Destroy()
+        end
+
+        if Data.Line and Data.Line.Parent then
+            Data.Line:Destroy()
+        end
+
+        if Data.Arrow and Data.Arrow.Parent then
+            Data.Arrow:Destroy()
+        end
+    end
+
+    self.ESPCount = 0
+
+    if Screen and Screen.Parent then
+        Screen:Destroy()
+    end
+end
+
+local Camera = workspace.CurrentCamera
+local ViewportSize = Camera and Camera.ViewportSize or Vector2.zero
+local ScreenCenter = ViewportSize / 2
+local FOVScale = Camera and Camera.FieldOfView / 70 or 1
+
+local LastCamera = Camera
+local LastViewportX = ViewportSize.X
+local LastViewportY = ViewportSize.Y
+local LastFOV = Camera and Camera.FieldOfView or 70
+local LastHeartbeat = os.clock()
+
+Library.Connection = RS.Heartbeat:Connect(function()
+    if Library.Unloaded then
+        return
+    end
+
+    local Now = os.clock()
+    local Settings = Library.Settings
+
+    Camera = workspace.CurrentCamera
+
+    if not Camera then
+        return
+    end
+
+    local CurrentViewport = Camera.ViewportSize
+    local CurrentFOV = Camera.FieldOfView
+
+    local CameraChanged = Camera ~= LastCamera
+
+    local ViewportChanged =
+        CurrentViewport.X ~= LastViewportX
+        or CurrentViewport.Y ~= LastViewportY
+
+    local FOVChanged = CurrentFOV ~= LastFOV
+
+    if CameraChanged or ViewportChanged or FOVChanged then
+        LastCamera = Camera
+        LastViewportX = CurrentViewport.X
+        LastViewportY = CurrentViewport.Y
+        LastFOV = CurrentFOV
+
+        ViewportSize = CurrentViewport
+        ScreenCenter = CurrentViewport / 2
+        FOVScale = CurrentFOV / 70
+
+        InvalidateScheduler()
+    end
+
+    local RainbowInterval =
+        1 / math.max(Settings.RainbowRate, 1)
+
+    if Now - Library.LastRainbow >= RainbowInterval then
+        Library.LastRainbow = Now
+        Library.RainbowColor =
+            Color3.fromHSV((Now % 5) / 5, 1, 1)
+    end
+
+    if Now - Library.LastCleanup >= Settings.CleanupInterval then
+        Library.LastCleanup = Now
+
+        for Object, Data in pairs(Library.Cache) do
+            if not Object or not Object.Parent then
+                Library:RemoveESP(Object)
+                continue
+            end
+
+            if not Data.Root or not Data.Root.Parent then
+                Data.Root = GetRoot(Object)
+            end
+
+            if Data.Box and not IsValidHighlight(Data.Box) then
+                Data.Box = nil
+                Data.HighlightInstance = nil
+                Data.OriginalHighlight = nil
+                Data.OwnsHighlight = false
+                Data.LastBoxEnabled = false
+            end
+        end
+    end
+
+    local RenderInterval =
+        1 / math.max(Settings.RenderTime, 1)
+
+    if Now - LastHeartbeat < RenderInterval then
+        return
+    end
+
+    LastHeartbeat = Now
+
+    local Processed = 0
+    local Budget = math.max(Settings.FrameBudget, 1)
+
+    while Library.SchedulerSize > 0 and Processed < Budget do
+        local Node
+
+        Node, Library.SchedulerSize =
+            HeapPop(
+                Library.Scheduler,
+                Library.SchedulerSize
+            )
+
+        if not Node then
+            break
+        end
+
+        if Node.Epoch ~= Library.SchedulerEpoch then
+            continue
+        end
+
+        if Node.Time > Now then
+            Library.SchedulerSize =
+                HeapPush(
+                    Library.Scheduler,
+                    Library.SchedulerSize,
+                    Node
+                )
+
+            break
+        end
+
+        local Object = Node.Object
+        local Data = Library.Cache[Object]
+
+        if not Data then
+            continue
+        end
+
+        if Data.ScheduleVersion ~= Node.Version then
+            continue
+        end
+
+        Processed += 1
+
+        if not Object or not Object.Parent then
+            Library:RemoveESP(Object)
+            continue
+        end
+
+        local RootPart = Data.Root
+
+        if not RootPart or not RootPart.Parent then
+            RootPart = GetRoot(Object)
+            Data.Root = RootPart
+
+            if not RootPart then
+                ScheduleObject(Data, Now + 0.5)
+                continue
+            end
+        end
+
+        local Position = RootPart.Position
+        local CameraCFrame = Camera.CFrame
+        local CameraPosition = CameraCFrame.Position
+
+        local DX = Position.X - CameraPosition.X
+        local DY = Position.Y - CameraPosition.Y
+        local DZ = Position.Z - CameraPosition.Z
+
+        local DistanceSquared =
+            DX * DX
+            + DY * DY
+            + DZ * DZ
+
+        local MaxDistance = Settings.MaxDistance
+        local MaxDistanceSquared =
+            MaxDistance * MaxDistance
+
+        if DistanceSquared > MaxDistanceSquared then
+            SetVisible(
+                Data,
+                false,
+                false,
+                false,
+                false
+            )
+
+            SetHighlightEnabled(Data, false)
+
+            ScheduleObject(
+                Data,
+                Now + GetLODInterval(
+                    DistanceSquared,
+                    Settings.RenderTime,
+                    Settings,
+                    Library.ESPCount
+                )
+            )
+
+            continue
+        end
+
+        local Distance = math.sqrt(DistanceSquared)
+
+        local LastPosition = Data.LastPosition
+
+        local MovementDX =
+            Position.X - LastPosition.X
+
+        local MovementDY =
+            Position.Y - LastPosition.Y
+
+        local MovementDZ =
+            Position.Z - LastPosition.Z
+
+        local MovementSquared =
+            MovementDX * MovementDX
+            + MovementDY * MovementDY
+            + MovementDZ * MovementDZ
+
+        Data.LastPosition = Position
+        Data.LastDistance = Distance
+
+        local Moving = MovementSquared > 0.0004
+
+        local ScreenPosition, IsOnScreen =
+            Camera:WorldToViewportPoint(Position)
+
+        local DisplayColor =
+            Settings.Rainbow
+            and Library.RainbowColor
+            or Data.Color
+
+        local ESPMode = Settings.ESPMode
+
+        local ShowHighlight =
+            ESPMode == "Highlight"
+            or ESPMode == "Highlight/Text"
+
+        local ShowText =
+            ESPMode == "Text"
+            or ESPMode == "Highlight/Text"
+
+        if IsOnScreen then
+            if ShowHighlight then
+                local Highlight = EnsureHighlight(Data)
+
+                if Highlight then
+                    SetHighlightColor(
+                        Data,
+                        DisplayColor
+                    )
+
+                    SetHighlightEnabled(
+                        Data,
+                        true
+                    )
+                else
+                    SetHighlightEnabled(
+                        Data,
+                        false
+                    )
+                end
+            else
+                SetHighlightEnabled(
+                    Data,
+                    false
+                )
+            end
+
+            SetVisible(
+                Data,
+                true,
+                ShowText,
+                Settings.Tracers and Distance < 1500,
+                false
+            )
+
+            if ShowText then
+                SetTextColor(
+                    Data,
+                    DisplayColor
+                )
+
+                local TextSize =
+                    Settings.TextSize * FOVScale
+
+                if Data.LastTextSize ~= TextSize then
+                    Data.Text.TextSize = TextSize
+                    Data.LastTextSize = TextSize
+                end
+
+                if Now >= Data.NextMetadataUpdate then
+                    local DistanceFloor =
+                        math.floor(Distance)
+
+                    if Settings.Distance then
+                        if Data.LastDisplayedDistance ~= DistanceFloor then
+                            Data.Text.Text =
+                                Data.Name
+                                .. "\n["
+                                .. DistanceFloor
+                                .. "m]"
+
+                            Data.LastDisplayedDistance =
+                                DistanceFloor
+                        end
+                    elseif Data.LastDisplayedDistance ~= -2 then
+                        Data.Text.Text = Data.Name
+                        Data.LastDisplayedDistance = -2
+                    end
+
+                    Data.NextMetadataUpdate =
+                        Now + Settings.MetadataInterval
+                end
+            end
+
+            if Settings.Tracers and Distance < 1500 then
+                SetLineColor(
+                    Data,
+                    DisplayColor
+                )
+
+                local SX = ScreenPosition.X
+                local SY = ScreenPosition.Y
+
+                local OriginX = ScreenCenter.X
+                local OriginY = ViewportSize.Y
+
+                local DifferenceX =
+                    SX - OriginX
+
+                local DifferenceY =
+                    SY - OriginY
+
+                local Length =
+                    math.sqrt(
+                        DifferenceX * DifferenceX
+                        + DifferenceY * DifferenceY
+                    )
+
+                local Rotation =
+                    math.deg(
+                        math.atan2(
+                            DifferenceY,
+                            DifferenceX
+                        )
+                    )
+
+                if
+                    Data.LastTracerX ~= SX
+                    or Data.LastTracerY ~= SY
+                    or Data.LastTracerLength ~= Length
+                    or Data.LastTracerRotation ~= Rotation
+                then
+                    Data.Line.Size =
+                        UDim2.new(
+                            0,
+                            Length,
+                            0,
+                            1
+                        )
+
+                    Data.Line.Position =
+                        UDim2.new(
+                            0,
+                            OriginX + DifferenceX * 0.5,
+                            0,
+                            OriginY + DifferenceY * 0.5
+                        )
+
+                    Data.Line.Rotation = Rotation
+
+                    Data.LastTracerX = SX
+                    Data.LastTracerY = SY
+                    Data.LastTracerLength = Length
+                    Data.LastTracerRotation = Rotation
+                end
+            end
+        else
+            SetVisible(
+                Data,
+                false,
+                false,
+                false,
+                Settings.Arrows
+            )
+
+            SetHighlightEnabled(
+                Data,
+                false
+            )
+
+            if Settings.Arrows then
+                SetArrowColor(
+                    Data,
+                    DisplayColor
+                )
+
+                local Relative =
+                    CameraCFrame:PointToObjectSpace(
+                        Position
+                    )
+
+                local DirectionAngle =
+                    math.atan2(
+                        -Relative.X,
+                        -Relative.Z
+                    )
+
+                local Radius =
+                    ViewportSize.Y * 0.4
+
+                local ArrowX =
+                    ScreenCenter.X
+                    + math.sin(DirectionAngle)
+                    * Radius
+
+                local ArrowY =
+                    ScreenCenter.Y
+                    + math.cos(DirectionAngle)
+                    * Radius
+
+                local ArrowRotation =
+                    math.deg(DirectionAngle)
+
+                if
+                    Data.LastArrowX ~= ArrowX
+                    or Data.LastArrowY ~= ArrowY
+                    or Data.LastArrowRotation ~= ArrowRotation
+                then
+                    Data.Arrow.Position =
+                        UDim2.new(
+                            0,
+                            ArrowX,
+                            0,
+                            ArrowY
+                        )
+
+                    Data.Arrow.Rotation =
+                        ArrowRotation
+
+                    Data.LastArrowX = ArrowX
+                    Data.LastArrowY = ArrowY
+                    Data.LastArrowRotation =
+                        ArrowRotation
+                end
+            end
+        end
+
+        local Interval =
+            GetLODInterval(
+                DistanceSquared,
+                Settings.RenderTime,
+                Settings,
+                Library.ESPCount
+            )
+
+        if Settings.MovementPriority then
+            if Moving then
+                Interval *= 0.55
+            else
+                Interval *= 1.15
+            end
+        end
+
+        ScheduleObject(
+            Data,
+            Now + math.max(
+                Interval,
+                1 / 60
+            )
+        )
+    end
+end)
+
+return Library
